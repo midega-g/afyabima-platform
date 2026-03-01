@@ -1,0 +1,46 @@
+repos:
+  # Ruff: linting (replaces flake8 + isort) and formatting (replaces black)
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.4
+    hooks:
+      - id: ruff
+        name: ruff lint
+        args: [--fix, --exit-non-zero-on-fix]
+      - id: ruff-format
+        name: ruff format
+
+  # Mypy: static type checking
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.19.1
+    hooks:
+      - id: mypy
+        name: mypy type check
+        additional_dependencies:
+          - pandas-stubs
+          - numpy
+        args: [--config-file=pyproject.toml]
+
+  # SQLFluff
+  - repo: https://github.com/sqlfluff/sqlfluff
+    rev: 4.0.4
+    hooks:
+      - id: sqlfluff-lint
+        args: [--dialect, postgres]
+        additional_dependencies: ['dbt-postgres==1.10.0', 'sqlfluff-templater-dbt']
+      - id: sqlfluff-fix
+        # Arbitrary arguments to show an example
+        # args: [--rules, "LT02,CP02"]
+        args: [--dialect, postgres]
+        additional_dependencies: ['dbt-postgres==1.10.0', 'sqlfluff-templater-dbt']
+
+  # General hygiene
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: debug-statements
+        name: no debug statements
