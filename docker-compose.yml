@@ -1,0 +1,265 @@
+# =============================================================================
+# AfyaBima — Docker Compose
+# =============================================================================
+#
+# ACTIVE SERVICES
+#   postgres    — PostgreSQL 16 (Alpine). Schema applied on first start.
+#   generator   — Python data generator. Writes CSVs to shared volume, then exits.
+#
+# COMMENTED SERVICES (uncomment in order as each layer is ready)
+#   Kafka stack     — zookeeper, kafka, schema-registry, kafka-connect, debezium
+#   dbt             — after postgres has data
+#   airflow         — after dbt marts layer exists
+#   fastapi         — after airflow + marts
+#
+# FIRST RUN
+#   1. cp .env.example .env  and fill in all passwords
+#   2. docker compose up --build
+#
+# LOAD CSVs AFTER GENERATOR EXITS
+#   docker exec afyabima-postgres bash /sql/load_csv.sh \
+#     --data-dir /tmp/afyabima_data --user kafka_connect --db afyabima
+#
+# FULL RESET (deletes all data)
+#   docker compose down -v && docker compose up --build
+# =============================================================================
+
+name: afyabima
+
+networks:
+  afyabima-net:
+    driver: bridge
+
+volumes:
+  pgdata:       # PostgreSQL data — survives `down`, deleted by `down -v`
+  csvdata:      # Generator CSVs — shared between generator (write) and postgres (read)
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # postgres
+  # Build context is project root so the Dockerfile can COPY from
+  # database_scripts/ without any path gymnastics.
+  # ---------------------------------------------------------------------------
+  postgres:
+    build:
+      context: .                            # project root — database_scripts/ is accessible
+      dockerfile: docker/postgres/Dockerfile
+    image: afyabima-postgres:latest
+    container_name: afyabima-postgres
+    command: ["postgres", "-c", "wal_level=logical"]
+    restart: unless-stopped
+    networks:
+      - afyabima-net
+    ports:
+      - "127.0.0.1:5432:5432"               # localhost only — not exposed to the network
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - csvdata:/tmp/afyabima_data:ro        # CSVs from generator (read-only for postgres)
+      # Mount operational SQL files so they can be re-run without rebuilding
+      - ./database_scripts/load_csv.sh:/sql/load_csv.sh:ro
+      - ./database_scripts/db_tests.sql:/sql/db_tests.sql:ro
+    environment:
+      POSTGRES_DB:       ${POSTGRES_DB}
+      POSTGRES_USER:     ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?et POSTGRES_PASSWORD in .env}
+      # Service role passwords — consumed by database_scripts/02_set_passwords.sh
+      KAFKA_CONNECT_PASSWORD: ${KAFKA_CONNECT_PASSWORD:?Set KAFKA_CONNECT_PASSWORD in .env}
+      DBT_RUNNER_PASSWORD:    ${DBT_RUNNER_PASSWORD:?Set DBT_RUNNER_PASSWORD in .env}
+      API_READER_PASSWORD:    ${API_READER_PASSWORD:?Set API_READER_PASSWORD in .env}
+      DEBEZIUM_PASSWORD:      ${DEBEZIUM_PASSWORD:?Set DEBEZIUM_PASSWORD in .env}
+      AIRFLOW_RUNNER_PASSWORD: ${AIRFLOW_RUNNER_PASSWORD:?Set AIRFLOW_RUNNER_PASSWORD in .env}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout:  5s
+      retries:  5
+      start_period: 30s
+
+  # ---------------------------------------------------------------------------
+  # generator
+  # Build context is project root — pyproject.toml, uv.lock, and
+  # data_generation/ are all at the root, directly accessible.
+  # Runs once and exits. Load CSVs manually after it finishes.
+  # ---------------------------------------------------------------------------
+  generator:
+    build:
+      context: .                            # project root
+      dockerfile: docker/generator/Dockerfile
+    image: afyabima-generator:latest
+    container_name: afyabima-generator
+    networks:
+      - afyabima-net
+    volumes:
+      - csvdata:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # ===========================================================================
+  # KAFKA STACK — uncomment all five together for Scenario B (streaming)
+  #
+  # Activation steps:
+  #   1. uv add kafka-python
+  #   2. docker compose up --build
+  #   3. python database_scripts/stream_producer.py --bootstrap-servers kafka:9092
+  # ===========================================================================
+
+  # zookeeper:
+  #   image: confluentinc/cp-zookeeper:7.6.0
+  #   container_name: afyabima-zookeeper
+  #   restart: unless-stopped
+  #   networks:
+  #     - afyabima-net
+  #   environment:
+  #     ZOOKEEPER_CLIENT_PORT: 2181
+  #     ZOOKEEPER_TICK_TIME:   2000
+  #   healthcheck:
+  #     test: ["CMD-SHELL", "echo ruok | nc localhost 2181 | grep imok"]
+  #     interval: 10s
+  #     timeout:  5s
+  #     retries:  5
+
+  # kafka:
+  #   image: confluentinc/cp-kafka:7.6.0
+  #   container_name: afyabima-kafka
+  #   restart: unless-stopped
+  #   networks:
+  #     - afyabima-net
+  #   ports:
+  #     - "127.0.0.1:9092:9092"
+  #   depends_on:
+  #     zookeeper:
+  #       condition: service_healthy
+  #   environment:
+  #     KAFKA_BROKER_ID:                        1
+  #     KAFKA_ZOOKEEPER_CONNECT:                zookeeper:2181
+  #     KAFKA_ADVERTISED_LISTENERS:             PLAINTEXT://kafka:9092
+  #     KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+  #     KAFKA_AUTO_CREATE_TOPICS_ENABLE:        "false"
+  #     KAFKA_LOG_RETENTION_HOURS:              168
+
+  # schema-registry:
+  #   image: confluentinc/cp-schema-registry:7.6.0
+  #   container_name: afyabima-schema-registry
+  #   restart: unless-stopped
+  #   networks:
+  #     - afyabima-net
+  #   ports:
+  #     - "127.0.0.1:8081:8081"
+  #   depends_on:
+  #     - kafka
+  #   environment:
+  #     SCHEMA_REGISTRY_HOST_NAME:                    schema-registry
+  #     SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: kafka:9092
+
+  # kafka-connect:
+  #   image: confluentinc/cp-kafka-connect:7.6.0
+  #   container_name: afyabima-kafka-connect
+  #   restart: unless-stopped
+  #   networks:
+  #     - afyabima-net
+  #   ports:
+  #     - "127.0.0.1:8083:8083"
+  #   depends_on:
+  #     - kafka
+  #     - schema-registry
+  #     - postgres
+  #   environment:
+  #     CONNECT_BOOTSTRAP_SERVERS:                      kafka:9092
+  #     CONNECT_REST_PORT:                              8083
+  #     CONNECT_GROUP_ID:                               afyabima-connect
+  #     CONNECT_CONFIG_STORAGE_TOPIC:                   _connect-configs
+  #     CONNECT_OFFSET_STORAGE_TOPIC:                   _connect-offsets
+  #     CONNECT_STATUS_STORAGE_TOPIC:                   _connect-status
+  #     CONNECT_CONFIG_STORAGE_REPLICATION_FACTOR:      1
+  #     CONNECT_OFFSET_STORAGE_REPLICATION_FACTOR:      1
+  #     CONNECT_STATUS_STORAGE_REPLICATION_FACTOR:      1
+  #     CONNECT_KEY_CONVERTER:                          org.apache.kafka.connect.storage.StringConverter
+  #     CONNECT_VALUE_CONVERTER:                        io.confluent.connect.avro.AvroConverter
+  #     CONNECT_VALUE_CONVERTER_SCHEMA_REGISTRY_URL:    http://schema-registry:8081
+  #     CONNECT_PLUGIN_PATH:                            /usr/share/java,/usr/share/confluent-hub-components
+
+  # debezium:
+  #   image: debezium/connect:2.6
+  #   container_name: afyabima-debezium
+  #   restart: unless-stopped
+  #   networks:
+  #     - afyabima-net
+  #   ports:
+  #     - "127.0.0.1:8084:8083"
+  #   depends_on:
+  #     - kafka
+  #     - postgres
+  #   environment:
+  #     BOOTSTRAP_SERVERS:         kafka:9092
+  #     GROUP_ID:                  afyabima-debezium
+  #     CONFIG_STORAGE_TOPIC:      _debezium-configs
+  #     OFFSET_STORAGE_TOPIC:      _debezium-offsets
+  #     STATUS_STORAGE_TOPIC:      _debezium-status
+  #     DATABASE_HOSTNAME:         postgres
+  #     DATABASE_PORT:             5432
+  #     DATABASE_USER:             debezium
+  #     DATABASE_PASSWORD:         ${DEBEZIUM_PASSWORD}
+  #     DATABASE_DBNAME:           ${POSTGRES_DB}
+  #     DATABASE_SERVER_NAME:      afyabima
+
+  # ===========================================================================
+  # dbt — uncomment after postgres has data
+  # ===========================================================================
+
+  # dbt:
+  #   image: ghcr.io/dbt-labs/dbt-postgres:1.8.0
+  #   container_name: afyabima-dbt
+  #   networks:
+  #     - afyabima-net
+  #   volumes:
+  #     - ./dbt:/usr/app/dbt
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #   environment:
+  #     DBT_PROFILES_DIR: /usr/app/dbt
+  #   command: ["run", "--profiles-dir", "/usr/app/dbt", "--project-dir", "/usr/app/dbt"]
+
+  # ===========================================================================
+  # airflow — uncomment after dbt marts layer exists
+  # ===========================================================================
+
+  # airflow:
+  #   image: apache/airflow:2.9.0-python3.11
+  #   container_name: afyabima-airflow
+  #   restart: unless-stopped
+  #   networks:
+  #     - afyabima-net
+  #   ports:
+  #     - "127.0.0.1:8080:8080"
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #   environment:
+  #     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/airflow
+  #     AIRFLOW__CORE__EXECUTOR:             LocalExecutor
+  #     AIRFLOW__CORE__FERNET_KEY:           ${AIRFLOW_FERNET_KEY}
+  #   volumes:
+  #     - ./airflow/dags:/opt/airflow/dags
+  #   command: standalone
+
+  # ===========================================================================
+  # fastapi — uncomment after airflow + marts are running
+  # ===========================================================================
+
+  # fastapi:
+  #   build:
+  #     context: ./api
+  #     dockerfile: Dockerfile
+  #   container_name: afyabima-fastapi
+  #   networks:
+  #     - afyabima-net
+  #   ports:
+  #     - "127.0.0.1:8000:8000"
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #   environment:
+  #     DATABASE_URL: postgresql://api_reader:${API_READER_PASSWORD}@postgres:5432/${POSTGRES_DB}
