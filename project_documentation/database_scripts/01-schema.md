@@ -225,15 +225,58 @@ Seven indexes support the access patterns required by dbt, fraud detection, and 
 
 Five tables that form the fraud detection and feedback loop. These are not written by Kafka Connect directly — they are written by Flink, FastAPI, the PySpark retraining job, and Airflow.
 
-**`raw.fraud_predictions`** — one row per claim per model scoring run. `feature_snapshot` is a `JSONB` column that records the exact feature values used at scoring time. This is not for querying convenience — it is for regulatory explainability. If a claim is disputed, the insurer must be able to show what the model saw. The `GIN` index on `feature_snapshot` supports dbt audit queries that filter on specific feature values.
+**`raw.fraud_predictions`** — one row per claim per model scoring run. `feature_snapshot` is a `JSONB` column that records the exact feature values used at scoring time. This is not for querying convenience — it is for regulatory explainability. If a claim is disputed, the insurer must be able to show what the model saw. Five indexes support the required access patterns:
 
-**`raw.fraud_investigations`** — the investigation lifecycle. Updated by FastAPI as investigators work through cases. References both `raw.claims` and optionally `raw.fraud_predictions` (the specific prediction that triggered the investigation). An investigation can exist without a corresponding prediction if it was opened manually.
+| Index | Purpose |
+| ------- | --------- |
+| `idx_fraud_predictions_claim_id` | FK lookup — used when investigations need to see the prediction that triggered them |
+| `idx_fraud_predictions_model_version` | Airflow model comparison queries (e.g., "how did v2.3 perform vs v2.2?"). Without this, evaluation would scan all predictions |
+| `idx_fraud_predictions_risk_tier` | API and dashboard filters for risk-based triage ("show all critical claims in last 24h") |
+| `idx_fraud_predictions_predicted_at` | **BRIN index** — predictions are generated in real-time, monotonically increasing. Used by dbt to incrementally process new predictions since last run |
+| `idx_fraud_predictions_features_gin` | **GIN index** on `feature_snapshot` JSONB. Regulatory audit queries filter on specific feature values (e.g., "claims where feature_snapshot $\rightarrow$'provider_risk_score' > 0.8"). Without GIN, these would require full-table scans |
+
+The GIN index is the largest in this table (~20% of table size) — this is an accepted trade-off for auditability.
+
+**`raw.fraud_investigations`** — the investigation lifecycle. Updated by FastAPI as investigators work through cases. References both `raw.claims` and optionally `raw.fraud_predictions` (the specific prediction that triggered the investigation). An investigation can exist without a corresponding prediction if it was opened manually. Three indexes cover the essential query patterns:
+
+| Index | Purpose |
+| ------- | --------- |
+| `idx_fraud_investigations_claim_id` | FK lookup — find all investigations for a given claim |
+| `idx_fraud_investigations_assigned_to` | Investigator workload queries ("show all cases assigned to user X") |
+| `idx_fraud_investigations_status` | Operational dashboards filtering by `status IN ('open', 'in_progress')` |
 
 **`raw.fraud_investigation_outcomes`** — the final investigator verdict. INSERT-only — once an outcome is recorded it is never modified. The constraint `outcomes_one_per_investigation_uq` enforces exactly one outcome per investigation. `outcomes_loss_requires_fraud_chk` enforces that `estimated_loss_kes` can only be set when `final_label = 'confirmed_fraud'` — a legitimate claim has no loss to record. This is the most important table in the fraud feedback loop: Debezium watches it and publishes every new row to the `investigations.closed` Kafka topic, which feeds the ML retraining pipeline.
 
-**`raw.model_performance_log`** — metrics written by the PySpark retraining job after each training run. `auc_roc`, `precision_at_10pct`, `recall`, and `f1_score` are all constrained to `[0, 1]`. The `promoted` column is set by Airflow after it reads this table and decides whether the new model version outperforms the current champion.
+Four indexes support the required access patterns, with careful consideration of which columns are updated vs. insert-only:
+
+| Index | Purpose |
+| ------- | --------- |
+| `idx_outcomes_claim_id` | FK lookup — joining outcomes back to claims for mart enrichment |
+| `idx_outcomes_investigation_id` | FK lookup — linking to investigations table (unique constraint also serves this) |
+| `idx_outcomes_final_label` | Used by retraining pipeline to filter only confirmed fraud cases. High selectivity (~3% of rows are fraud) |
+| `idx_outcomes_confirmed_at` | **BRIN index** — outcomes are written once, in chronological order. Used by dbt to incrementally process new labels for retraining |
+
+Note: No index on `fraud_type` — cardinality is low (5 values) and it's rarely used as a standalone filter without `final_label`.
+
+**`raw.model_performance_log`** — metrics written by the PySpark retraining job after each training run. `auc_roc`, `precision_at_10pct`, `recall`, and `f1_score` are all constrained to `[0, 1]`. The `promoted` column is set by Airflow after it reads this table and decides whether the new model version outperforms the current champion. Two indexes support the promotion decision workflow:
+
+| Index | Purpose |
+| ------- | --------- |
+| `idx_model_perf_evaluation_date` | Time-ordered queries for trend analysis ("how is model performance trending?") |
+| `idx_model_perf_promoted` | Quick lookup of current champion model(s). Partial index consideration: `WHERE promoted = TRUE` would be more efficient if this query becomes frequent |
 
 **`raw.dlq_events`** — the dead-letter queue sink. When Kafka Connect cannot write a message to its target table (schema mismatch, constraint violation, etc.), it routes the failed message here instead. `raw_payload` stores the original Kafka message as JSONB. The partial index `WHERE resolved = FALSE` on the `resolved` column means the index only covers unresolved records — as records are resolved, they drop out of the index automatically, keeping it small. Airflow monitors this table and alerts when unresolved depth exceeds 10.
+
+Four indexes serve the DLQ monitoring and resolution workflow:
+
+| Index | Purpose |
+| ------- | --------- |
+| `idx_dlq_source_topic` | Identifying which topics are generating the most failures |
+| `idx_dlq_resolved` | **Partial index** `WHERE resolved = FALSE` — keeps the active monitoring index tiny; resolved records are excluded automatically |
+| `idx_dlq_failed_at` | **BRIN index** — chronological failure patterns. Used to detect if failures spike at certain times |
+| `idx_dlq_error_code` | (Not currently indexed) — if error-code analysis becomes frequent, add B-tree index |
+
+The DLQ design prioritises operational monitoring over analytical queries — hence the partial index on unresolved records and BRIN for time-based analysis.
 
 ### Section 6 — staging and intermediate stubs
 
