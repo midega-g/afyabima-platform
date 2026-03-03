@@ -280,15 +280,73 @@ The DLQ design prioritises operational monitoring over analytical queries — he
 
 ### Section 6 — staging and intermediate stubs
 
-No tables are created here. The section consists of schema-level comments only. `dbt` creates the actual views when it runs. The schemas exist so that grants and connection tests can be performed before dbt has run for the first time.
+No tables are created in these schemas. The section consists of schema-level comments only. **dbt** creates the actual views when it runs.
+
+**Why stubs are needed:** PostgreSQL requires a schema to exist before any objects can be created in it. More importantly, the `GRANT USAGE` statements in Section 2 would fail if the schemas didn't exist at grant time. By creating the schemas here (even empty), we enable:
+
+- Role permissions to be set before dbt runs
+- Connection tests from Airflow and FastAPI to validate authentication
+- `ALTER DEFAULT PRIVILEGES` to take effect for future objects dbt creates
+
+**What dbt actually creates:**
+
+- `staging` — one view per raw table. Responsible for renaming, casting, and basic deduplication. No joins.
+- `intermediate` — business logic and joins. Never accessed directly by applications.
+
+Both are **views**, not tables — they add no storage cost and always reflect the latest raw data. dbt recreates them on every run.
+
+**Schema-level comments** (already present) explain this to anyone who connects via psql:
+
+```sql
+COMMENT ON SCHEMA staging IS
+    'One view per raw table. Rename, cast, deduplicate. No joins. Created by dbt.';
+```
 
 ### Section 7 — marts stubs
 
-Nine empty tables created so that grants and API connection tests can be validated before dbt populates them. `dbt` runs `INSERT` or `DELETE + INSERT` on these on every pipeline run. The stubs have the same column definitions that dbt will write — any mismatch would be caught as a dbt error on first run.
+Nine empty tables created so that grants and API connection tests can be validated before dbt populates them. **dbt** runs `INSERT` or `DELETE + INSERT` on these on every pipeline run. The stubs have the same column definitions that dbt will write — any mismatch would be caught as a dbt error on first run.
 
-`marts.dim_members` is the only mart table with a surrogate primary key (`member_sk`). It implements SCD Type 2: each row represents a member's attributes for a specific time window, managed by dbt snapshots. The `dbt_valid_from`, `dbt_valid_to`, and `dbt_is_current` columns are the SCD2 bookkeeping fields.
+**Why stubs instead of letting dbt create them?** Three reasons:
 
-`marts.mart_claims_performance` has a composite primary key on `(summary_month, plan_code)` but also a `UNIQUE` index using `COALESCE` on nullable columns. This is because `employer_id` and `county` can be NULL (some claims have no employer, some summaries are not county-scoped), and a standard `UNIQUE` constraint treats two NULLs as non-equal — meaning two rows with the same month and plan but both having NULL employer would not be caught. `COALESCE(employer_id, '')` converts NULL to an empty string, making NULLs comparable for uniqueness purposes.
+1. **Grants** — `api_reader` and `airflow_runner` need `SELECT` permission on marts tables. Grants can only be applied to existing tables.
+2. **Connection testing** — FastAPI health checks can verify it can query the tables before data exists.
+3. **Schema validation** — Any mismatch between stub definitions and dbt models is caught immediately on first run.
+
+**Important notes about each mart table:**
+
+| Table | Key Points |
+| ------- | --------- |
+| **`marts.fct_claims`** | Fact table with fraud context. `claim_id` is the natural key — matches raw.claims one-to-one. No SCD. |
+| **`marts.fct_fraud_scoring`** | Links predictions to final labels. `was_correct` is populated after outcomes are known. Enables model performance monitoring. |
+| **`marts.fct_payments`** | One row per payment. A claim may have multiple rows. Includes `employer_id` for employer-level financial reporting. |
+| **`marts.dim_members`** | **SCD Type 2** — the only slowly-changing dimension. `member_sk` is a surrogate key; `dbt_valid_from`/`_to` define the time window; `dbt_is_current` flags the active row. History is preserved when attributes change. |
+| **`marts.dim_providers`** | Type 1 dimension (overwrite). Risk metrics (`total_claims_30d`, `fraud_rate_90d`) are recomputed nightly. |
+| **`marts.mart_claims_performance`** | Monthly aggregate. `employer_id` and `county` can be NULL. Uses a `UNIQUE` index with `COALESCE` (see detailed explanation below). |
+| **`marts.mart_provider_analytics`** | Daily provider metrics. `analytics_date` is the date of aggregation, not service date. Primary key is `(provider_id, analytics_date)`. |
+| **`marts.mart_member_utilisation`** | Monthly member-level utilisation against plan limits. `ytd_utilisation_pct` is year-to-date percentage of annual limit consumed. |
+| **`marts.mart_supply_chain_summary`** | Daily stock snapshot with derived fields. `is_below_reorder` is calculated; `stockout_days_30d` is a rolling window metric. |
+
+**Special design notes:**
+
+**`marts.dim_members` surrogate key** — The only mart table with a synthetic primary key. This is required for SCD Type 2 because a single `member_id` can appear in multiple rows (different time periods). `member_sk` is typically `member_id || '_' || dbt_scd_id` in practice.
+
+**`marts.mart_claims_performance` unique constraint** — The `UNIQUE` index using `COALESCE` solves a PostgreSQL limitation: standard unique constraints treat multiple NULLs as distinct. Without this, you could have two rows with the same `(summary_month, plan_code)` where one has NULL employer and the other also has NULL employer — both would be allowed, violating business rules. `COALESCE(employer_id, '')` converts NULL to an empty string, making them comparable and enforcing true uniqueness.
+
+**`marts.fct_fraud_scoring.was_correct`** — This column is NULL until an investigation outcome is recorded. It is updated when `fraud_investigation_outcomes` is written, not at prediction time. This enables retrospective accuracy analysis without reprocessing.
+
+**No column comments on marts tables** — Column-level comments are intentionally omitted here because:
+
+- Mart schemas are fully managed by dbt, which can (and should) document them in `schema.yml` files
+- The stubs exist only for grants and testing; actual usage reads from dbt documentation
+- Duplicating comments would create a maintenance burden (they'd need to stay in sync with dbt)
+
+**What happens on first dbt run:** dbt will:
+
+1. Validate that the stub schemas match its expectations
+2. Truncate and reload or incrementally update each table
+3. Apply its own documentation and testing framework
+
+The stubs are scaffolding — they enable the platform to start cleanly, but dbt takes over ownership from the first pipeline run onward.
 
 ### Section 8 — Debezium logical replication publication
 
