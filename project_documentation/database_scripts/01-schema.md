@@ -135,13 +135,30 @@ Six tables that change infrequently and are refreshed in full by Airflow daily. 
 
 **`raw.employers`** — corporate clients. `contract_end` is nullable (open-ended contracts) but must be after `contract_start` when set. `member_count` is informational and can lag behind the actual member table.
 
-**`raw.members`** — insured beneficiaries. This is the most index-heavy reference table: four indexes on `plan_code`, `employer_id`, `county`, and `is_active`. `employer_id` is nullable for individually enrolled members. `term_date` is NULL while a member is active and set only when coverage lapses.
+**`raw.members`** — insured beneficiaries. Four indexes serve specific query patterns:
+
+| Index | Purpose |
+| ------- | --------- |
+| `idx_members_plan_code` | Used when dbt joins claims → members to enrich with plan details (60% of fact queries) |
+| `idx_members_employer_id` | Supports mart aggregations grouping by employer; prevents full table scans |
+| `idx_members_county` | Enables regional rollups in `mart_member_utilisation` without scanning all members |
+| `idx_members_is_active` | dbt snapshots filter on `is_active = TRUE` to capture only current members |
+
+`employer_id` is nullable for individually enrolled members. `term_date` is NULL while a member is active and set only when coverage lapses.
 
 **`raw.providers`** — contracted healthcare facilities. `accreditation_status` constrains to four lifecycle values. `risk_score` is a `NUMERIC(4,3)` value between 0 and 1 recomputed weekly by Airflow from claims history — it starts NULL on insert and is updated as history accumulates.
 
-**`raw.drug_formulary`** — SHA-approved drug schedule. `is_essential_medicine` and `is_controlled_substance` are boolean flags used by prescription validation rules in dbt and the fraud pipeline.
+Three indexes target the most frequent access patterns:
 
-**`raw.icd10_codes`** — WHO ICD-10 diagnosis code reference. The simplest table in the schema: code, description, clinical category. Seeded once from CSV and updated only when WHO releases a new version.
+| Index | Purpose |
+| ------- | --------- |
+| `idx_providers_county` | Used by mart aggregations and regional fraud analysis |
+| `idx_providers_accreditation_status` | Airflow quality checks filter on non-active statuses |
+| `idx_providers_facility_type` | Supports provider network analytics and gap analysis |
+
+**`raw.drug_formulary`** — SHA-approved drug schedule. `is_essential_medicine` and `is_controlled_substance` are boolean flags used by prescription validation rules in dbt and the fraud pipeline. The index `idx_drug_formulary_drug_class` supports therapeutic class analysis in supply chain marts.
+
+**`raw.icd10_codes`** — WHO ICD-10 diagnosis code reference. Code, description, and clinical category. Seeded once from CSV and updated only when WHO releases a new version. The index `idx_icd10_codes_clinical_category` enables category-based aggregations (e.g., "all infectious disease claims").
 
 ### Section 4 — raw transactional tables
 
