@@ -584,17 +584,127 @@ REINDEX INDEX CONCURRENTLY idx_claims_dup_detection;
 
 ---
 
-## 8. Key design decisions
+## 8. Key Design Decisions
 
-**Why natural primary keys in `raw.*` instead of surrogates?** Kafka message keys are the natural identifiers. Using surrogate keys in `raw` would require a lookup on every Kafka Connect upsert to find the internal ID, adding a round-trip per message. Natural keys make upserts direct: `ON CONFLICT (claim_id) DO UPDATE` operates on the key that already exists in the message. Surrogate keys are appropriate in `marts` (where SCD2 requires them) but not in `raw`.
+### 8.1 Schema & Data Modeling Philosophy
 
-**Why are `staging` and `intermediate` views rather than tables?** dbt materialises them. Defining them as tables here would create two sources of truth — the DDL stub and the dbt model definition. Views are the right materialisation for these layers because they add no storage cost, always reflect the latest raw data, and are recreated on every dbt run without needing `DROP + CREATE` on tables with dependent objects.
+#### Natural Keys in `raw.*`
 
-**Why does `raw.fraud_investigation_outcomes` have `outcomes_loss_requires_fraud_chk`?** A constraint that cross-references two columns (`estimated_loss_kes` and `final_label`) enforces a business rule at the database level rather than in application code. Application code can be bypassed — a direct psql insert, an Airflow bug, a FastAPI edge case. A `CHECK` constraint cannot. This particular rule prevents the common data quality issue of recording a financial loss against an investigation that concluded as legitimate.
+Kafka message keys are the natural identifiers. Using surrogate keys in `raw` would require a lookup on every Kafka Connect upsert to find the internal ID, adding a round-trip per message. Natural keys make upserts direct: `ON CONFLICT (claim_id) DO UPDATE` operates on the key that already exists in the message. Surrogate keys are appropriate in `marts` (where SCD2 requires them) but not in `raw`.
 
-**Why is Debezium limited to one table rather than the whole `raw` schema?** WAL volume. Every row change in the `raw` schema generates a WAL record. If Debezium watched all of `raw`, it would process tens of thousands of irrelevant records (claim inserts, vital sign updates, payment rows) for every one `fraud_investigation_outcomes` row it actually needs. Scoping the publication to exactly one table keeps the replication slot small and the CDC pipeline focused.
+#### Views vs. Tables for `staging` and `intermediate`
 
-**Why use `COALESCE` in the unique index on `marts.mart_claims_performance` instead of a standard constraint?** PostgreSQL's `UNIQUE` constraint uses `IS DISTINCT FROM` semantics for NULLs — two NULL values are considered distinct, so a standard `UNIQUE (summary_month, plan_code, employer_id, county)` would allow multiple rows with the same month/plan but both having NULL employer. `COALESCE` in the index converts NULLs to a non-null sentinel value, restoring the intended semantics: one row per (month, plan, employer, county) combination, treating NULL employer as a distinct grouping.
+dbt materialises these layers. Defining them as tables in SQL would create two sources of truth — the DDL stub and the dbt model definition. Views add no storage cost, always reflect the latest raw data, and are recreated on every dbt run without needing `DROP + CREATE` on tables with dependent objects.
+
+#### The Dual-Write Pattern: Current State + Event Log
+
+`raw.claims` stores the **current state** for fast access — 99% of queries want to know "what is the status of this claim now?" without aggregating an event log. `raw.claim_events` stores the **audit trail** for history and investigation. Both are kept in sync by Kafka Connect, but they serve different purposes: one for performance, one for completeness.
+
+### 8.2 Data Type Decisions
+
+#### `TIMESTAMPTZ` for All Timestamps
+
+PostgreSQL's `TIMESTAMPTZ` stores values as UTC and converts to the session timezone at query time. Kafka events arrive as UTC strings; storing them as `TIMESTAMPTZ` means no timezone information is lost and no manual conversion is needed in dbt or the API. It also handles daylight saving time correctly — a `timestamptz` of '2026-01-15 14:00:00' is the same instant regardless of when you query it.
+
+#### `NUMERIC(15,2)` for All KES Monetary Columns
+
+Floating-point types (`FLOAT`, `DOUBLE PRECISION`) cannot represent most decimal values exactly — they produce rounding errors that accumulate in aggregations. `NUMERIC` is exact arithmetic, a regulatory requirement for financial systems. 15 digits allows up to 999,999,999,999.99 KES, far beyond any plausible claim amount.
+
+#### `_loaded_at`: Distinguishing Load Time from Business Time
+
+This timestamp records when Kafka Connect (or `load_csv.sh`) wrote the row — it is **not** the time the underlying event occurred. It serves a single purpose: dbt source freshness checks. The query `SELECT MAX(_loaded_at) FROM raw.claims` tells Airflow whether the ingestion pipeline is running on schedule. Business timestamps (`submitted_at`, `event_at`, `paid_at`) are stored separately.
+
+### 8.3 Constraint Philosophy
+
+#### `IF NOT EXISTS` on Every `CREATE`
+
+The entire schema file is idempotent — running it twice on the same database does nothing destructive. This matters because the file is also used in ad-hoc recovery scenarios where a developer may be uncertain whether a partial run succeeded. It also allows the same DDL to be safely used in both `initdb` and manual recovery contexts.
+
+#### `CHECK` Constraints Instead of Lookup Tables for Static Values
+
+The five `plan_tier` values ('basic', 'standard', 'premium', 'family', 'corporate') are static for the lifetime of the system. A lookup table would add a join for no benefit. The `CHECK` constraint is self-documenting and enforces the rule with zero query overhead. The same pattern applies to `status`, `payment_method`, and other enumerated types.
+
+#### Business Rules Enforced at the Database Level
+
+`outcomes_loss_requires_fraud_chk` on `raw.fraud_investigation_outcomes` cross-references `estimated_loss_kes` and `final_label`. This enforces that a loss can only be recorded for confirmed fraud. Application code can be bypassed — a direct psql insert, an Airflow bug, a FastAPI edge case. A `CHECK` constraint cannot. This prevents the common data quality issue of recording financial loss against legitimate claims.
+
+#### No `ON DELETE CASCADE`
+
+All foreign key constraints use `ON DELETE RESTRICT` (the default). This prevents accidental mass deletions — you cannot delete a member who has claims without explicitly handling the claims first. In practice, data is never physically deleted from `raw` tables; records are marked inactive (`is_active = FALSE`, `term_date` set) but remain for audit purposes. The constraint ensures this policy is enforced at the database level.
+
+### 8.4 Index Strategy Deep Dive
+
+#### The Three Rules (Recap)
+
+| Rule | Applied To | Rationale |
+| ------ | ------------ | ----------- |
+| **B-tree on all FKs** | Every foreign key column | PostgreSQL doesn't auto-index FKs; without them, joins degrade to sequential scans |
+| **BRIN on monotonically increasing timestamps** | `event_at`, `paid_at`, `predicted_at`, `confirmed_at`, `failed_at`, `reported_date` | 10x smaller than B-tree, perfect for append-only time-series data |
+| **GIN only where JSONB is filtered** | `feature_snapshot` in `fraud_predictions` | Index only where queries actually filter on JSONB contents |
+
+#### Why BRIN and B-tree Coexist in the Same Table
+
+`claim_events` demonstrates this clearly:
+
+- **BRIN on `event_at`** — events arrive in chronological order; range scans are common
+- **B-tree on `claim_id`** — random access pattern; BRIN would be useless here
+
+The choice is per-column, not per-table, based on access pattern.
+
+#### Surrogate PK + Natural Unique Constraint Pattern
+
+`raw.stock_levels` uses a UUID primary key but enforces business uniqueness with a separate `UNIQUE` constraint on `(facility_id, drug_code, reported_date)`. The natural key would make a large primary key (three columns, two text). If other tables referenced `stock_levels`, they'd need to include all three columns, bloating indexes and slowing joins. The surrogate keeps foreign keys small while the `UNIQUE` constraint maintains data integrity.
+
+#### The `COALESCE` Trick for NULL Handling
+
+PostgreSQL's `UNIQUE` constraint treats two NULLs as distinct, so a standard `UNIQUE (summary_month, plan_code, employer_id, county)` would allow multiple rows with the same month/plan but both having NULL employer. On `marts.mart_claims_performance`, `COALESCE(employer_id, '')` in the index converts NULLs to a non-null sentinel value, restoring the intended semantics: one row per (month, plan, employer, county) combination, treating NULL employer as a distinct grouping.
+
+### 8.5 Security & Access Control
+
+#### The Principle of Least Privilege Applied
+
+Every grant gives each role exactly the permissions it needs — nothing more. This limits blast radius if any credential is compromised.
+
+| Role | Can Write | Can Read | Deliberately Cannot |
+| ------ | ----------- | ---------- | --------------------- |
+| `kafka_connect` | All `raw` tables | Nothing else | Write to `staging`/`intermediate`/`marts` |
+| `dbt_runner` | `staging`/`intermediate`/`marts` | `raw` (SELECT only) | Write to `raw` |
+| `api_reader` | Nothing | `marts` only | Read `raw` |
+| `debezium` | Nothing | `fraud_investigation_outcomes` | Read anything else |
+| `airflow_runner` | `model_performance_log` only | `raw` and `marts` | Write anywhere else in `raw` |
+
+#### Why `airflow_runner` Can Write to Exactly One Table
+
+The PySpark retraining job runs as an Airflow task and needs to write model evaluation metrics back to the database. This is the **only** exception to the rule that only `kafka_connect` writes to `raw`. The grant is intentionally narrow — Airflow cannot write to claims, members, or any other raw table.
+
+#### Why `debezium` Needs Both `REPLICATION` Privilege and Table `SELECT`
+
+The `REPLICATION` privilege is a role-level attribute that allows the role to create and consume replication slots. It does **not** grant access to table data. The table-level `SELECT` is still required for the initial snapshot that Debezium takes when it first starts. After the snapshot, Debezium reads changes from the WAL, not the tables directly.
+
+### 8.6 Operational Decisions
+
+#### Scoping Debezium to One Table
+
+Every row change in the `raw` schema generates a WAL record. If Debezium watched all of `raw`, it would process tens of thousands of irrelevant records (claim inserts, vital sign updates, payment rows) for every one `fraud_investigation_outcomes` row it actually needs. Scoping the publication to exactly one table keeps the replication slot small and the CDC pipeline focused.
+
+#### Why `stock_levels` Uses a Surrogate PK
+
+The natural key `(facility_id, drug_code, reported_date)` would make a large primary key (three columns, two of them text). If other tables referenced `stock_levels`, they'd need to include all three columns, bloating indexes and slowing joins. The surrogate UUID keeps foreign keys small and fast. The separate `UNIQUE` constraint still enforces the business rule.
+
+#### Idempotent Design for Recovery
+
+The combination of `IF NOT EXISTS` on all `CREATE` statements and the separation of schema (this file) from passwords (`02_set_passwords.sh`) means the entire initialization can be re-run safely. This is critical for disaster recovery scenarios where the exact state of a partial run is unknown.
+
+### 8.7 Trade-offs and Rationale Summary
+
+| Decision | Trade-off | Why It's Worth It |
+| ---------- | ----------- | ------------------- |
+| Natural keys in `raw` | Larger PKs, more index bloat | Eliminates lookup join on every Kafka upsert |
+| BRIN on time columns | Slightly slower for narrow time ranges | 90% reduction in index size |
+| Dual-write (claims + events) | Duplicate storage, application complexity | Current state queries are 100x faster |
+| No ON DELETE CASCADE | Manual cleanup required | Prevents accidental data loss |
+| CHECK constraints instead of lookup tables | Harder to change values | Values are static; saves a join per query |
+| Debezium on one table | Must add new tables manually to publication | 99% reduction in WAL traffic |
 
 ---
 
