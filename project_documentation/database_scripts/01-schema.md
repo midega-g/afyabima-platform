@@ -499,11 +499,88 @@ The permission model is designed to contain security breaches. If a credential i
 
 The index choices follow three rules applied consistently across all tables.
 
-Every foreign key column gets a B-tree index. PostgreSQL does not create indexes on foreign keys automatically, but FK lookups are extremely common — every join between claims and members, for example, traverses the `member_id` FK. Without indexes on FK columns, these joins degrade to sequential scans.
+**1. Every foreign key column gets a B-tree index.** PostgreSQL does not create indexes on foreign keys automatically, but FK lookups are extremely common — every join between claims and members, for example, traverses the `member_id` FK. Without indexes on FK columns, these joins degrade to sequential scans.
 
-Append-only tables with monotonically increasing timestamps use `BRIN` indexes rather than B-tree. BRIN (Block Range Index) stores the min/max value per range of disk blocks. It is tiny compared to B-tree and extremely fast for range scans on columns that are physically ordered by insertion time — which is exactly the case for `event_at`, `paid_at`, `predicted_at`, `confirmed_at`, `failed_at`, and `reported_date`. A B-tree on these columns would be much larger and provide no meaningful benefit over BRIN for range queries.
+**2. Append-only tables with monotonically increasing timestamps use `BRIN` indexes** rather than B-tree. BRIN (Block Range Index) stores the min/max value per range of disk blocks. It is tiny compared to B-tree and extremely fast for range scans on columns that are physically ordered by insertion time — which is exactly the case for `event_at`, `paid_at`, `predicted_at`, `confirmed_at`, `failed_at`, and `reported_date`. A B-tree on these columns would be much larger and provide no meaningful benefit over BRIN for range queries.
 
-`JSONB` columns get `GIN` indexes only where queries actually filter on their contents. `feature_snapshot` in `raw.fraud_predictions` gets a GIN index because dbt audit queries filter on specific feature values. `metadata` in `raw.claim_events` does not — it is queried by retrieving the whole row, not by filtering on its contents.
+**3. `JSONB` columns get `GIN` indexes only where queries actually filter on their contents.** `feature_snapshot` in `raw.fraud_predictions` gets a GIN index because dbt audit queries filter on specific feature values. `metadata` in `raw.claim_events` does not — it is queried by retrieving the whole row, not by filtering on its contents.
+
+> **Detailed index explanations** for each table (including the specific queries each index serves) are documented in the table's own section:
+>
+> - Reference tables: [Section 3](#section-3--raw-reference-tables)
+> - Transactional tables: [Section 4](#section-4--raw-transactional-tables)
+> - Fraud pipeline tables: [Section 5](#section-5--raw-fraud-pipeline-tables)
+
+### 7.1 Index Trade-offs
+
+Every index improves read performance at the cost of write performance and disk space. The current index set balances these factors for the expected workload:
+
+| Trade-off | Impact | Acceptance Rationale |
+| ----------- | -------- | ---------------------- |
+| **Write slowdown** | Each additional index adds ~10-20% overhead to `INSERT`/`UPDATE` | Kafka Connect batch writes (~5000 rows/batch) absorb this overhead; indexes are essential for query performance |
+| **Disk space** | Indexes typically consume 20-40% of table size | Storage is cheap; query performance is critical |
+| **BRIN vs. B-tree** | BRIN indexes are ~10x smaller but slightly slower for very narrow time ranges | The space savings outweigh the minimal performance difference for our time-series queries |
+
+**Not every column that *could* be indexed *is* indexed.** The following columns were deliberately left unindexed:
+
+| Table | Column | Why No Index? |
+| ------- | -------- | --------------- |
+| `raw.claims` | `amount_claimed` | Numeric range scans are rare; filtering by amount happens in dbt after joins, not directly on raw table |
+| `raw.prescriptions` | `dispensed_on_site` | Low cardinality (boolean) and not used as a standalone filter |
+| `raw.stock_levels` | `quantity_on_hand` | Always queried with facility + drug filters first; the existing composite index covers it |
+
+### 7.2 Future Index Candidates
+
+These indexes are not currently present but may be needed as query patterns evolve. Monitor the queries running in production and add them if needed:
+
+| Table | Candidate Index | Trigger to Add |
+| ------- | ----------------- | ---------------- |
+| `raw.claims` | `(date_of_service, status)` | If fraud team frequently queries "pending_review claims from last 7 days" |
+| `raw.members` | `(plan_code, is_active)` | If plan-level active member counts become a frequent dashboard query |
+| `raw.fraud_predictions` | `(model_version, predicted_at)` | If model comparison queries need time windows per version |
+| `raw.dlq_events` | `(error_code)` | If error-code analysis becomes a common debugging step |
+
+**How to decide:** Use `pg_stat_user_indexes` and `pg_stat_user_tables` to identify sequential scans that could benefit from new indexes:
+
+```sql
+SELECT schemaname, tablename, seq_scan, seq_tup_read, idx_scan
+FROM pg_stat_user_tables
+WHERE seq_scan > 1000 AND seq_tup_read > 1000000
+ORDER BY seq_scan DESC;
+```
+
+### 7.3 What to Avoid
+
+Over-indexing is a common mistake. This schema intentionally avoids:
+
+- **Indexes on low-cardinality columns** (e.g., `gender`, `is_emergency`) — they're rarely selective enough to help
+- **Composite indexes that duplicate other indexes** — e.g., `(member_id, date_of_service)` would duplicate `idx_claims_member_id` for most queries
+- **Indexes on columns never used in `WHERE`, `JOIN`, or `ORDER BY`** — they'd only slow down writes
+
+**Example of an index NOT created:**
+
+```sql
+-- NOT CREATED: Gender is only used in aggregations, never as a filter
+CREATE INDEX idx_members_gender ON raw.members(gender);  -- Don't do this
+```
+
+### 7.4 Index Maintenance
+
+PostgreSQL automatically maintains indexes during `INSERT`, `UPDATE`, and `DELETE`. However, over time, indexes can become bloated. Monitor index bloat with:
+
+```sql
+-- Check index bloat (run monthly)
+SELECT schemaname, tablename, indexname, 
+       pg_size_pretty(pg_relation_size(indexrelid)) as index_size
+FROM pg_stat_user_indexes
+ORDER BY pg_relation_size(indexrelid) DESC;
+```
+
+If any index grows unexpectedly large, consider `REINDEX` during a maintenance window:
+
+```sql
+REINDEX INDEX CONCURRENTLY idx_claims_dup_detection;
+```
 
 ---
 
