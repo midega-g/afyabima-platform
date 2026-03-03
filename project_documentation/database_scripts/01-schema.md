@@ -433,6 +433,8 @@ FROM pg_replication_slots;
 
 Debezium's WAL-based approach has no impact on transaction performance and provides exactly-once semantics with offset tracking in Kafka.
 
+Here is the rewritten section, incorporating your existing text and the suggested enhancements into a single, comprehensive document.
+
 ### Section 9 — Explicit table-level grants
 
 ```sql
@@ -441,9 +443,55 @@ GRANT SELECT ON ALL TABLES IN SCHEMA raw TO dbt_runner, airflow_runner, debezium
 ...
 ```
 
-`ALTER DEFAULT PRIVILEGES` only applies to tables created after it is issued. The tables created in sections 3–5 of this file already existed by the time the grants in section 2 were set. Section 9 retroactively applies the correct grants to all of them using `GRANT ... ON ALL TABLES IN SCHEMA`. Without this section, all the tables would exist but none of the service roles would be able to read or write them.
+#### Why explicit grants are needed
 
-Two specific grants deserve attention: `GRANT INSERT ON raw.model_performance_log TO airflow_runner` gives Airflow write access to exactly one table in `raw` (the PySpark job submits via Airflow). `GRANT INSERT ON raw.dlq_events TO kafka_connect` is separate from the bulk grant because DLQ writes need to be explicit — Kafka Connect should be able to write dead-letter records even if its sink target table is the one it cannot write to.
+`ALTER DEFAULT PRIVILEGES` (configured in [Section 2](#section-2--schemas-and-grants)) only applies to tables created **after** the default is set. The tables in `raw`, `staging`, `intermediate`, and `marts` were all created in Sections 3–7 *before* the `ALTER DEFAULT PRIVILEGES` statements in Section 2 took effect. This section retroactively applies the correct permissions to every existing table using `GRANT ... ON ALL TABLES IN SCHEMA`.
+
+Without this section, all the tables would exist but none of the service roles would be able to read or write them.
+
+#### Complete privilege matrix
+
+The following table summarises the effective permissions after both default privileges and this section are applied.
+
+| Role | `raw` (all tables) | `raw` (specific) | `staging` | `intermediate` | `marts` |
+| --- | :--- | --- | :---: | :--- | :--- |
+| **`kafka_connect`** | `SELECT`, `INSERT`, `UPDATE`, `DELETE` | `INSERT` on `dlq_events` | — | — | — |
+| **`dbt_runner`** | `SELECT` | — | `ALL` | `ALL` | `ALL` |
+| **`api_reader`** | — | — | — | — | `SELECT` |
+| **`debezium`** | `SELECT` | — | — | — | — |
+| **`airflow_runner`** | `SELECT` | `INSERT` on `model_performance_log` | — | — | `SELECT` |
+
+*Note: `ALL` privilege includes `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`, `REFERENCES`, and `TRIGGER`.*
+
+#### Rationale for key grants
+
+| Grant | Why It Exists |
+| :--- | :--- |
+| **`kafka_connect`** with `INSERT`, `UPDATE`, `DELETE` on `raw` | Kafka Connect performs upserts on `raw.claims` (requiring `UPDATE`) and writes new records (`INSERT`). `DELETE` is rarely used but necessary for potential compaction or cleanup operations. |
+| **`dbt_runner`** with only `SELECT` on `raw` | dbt reads raw data to build staging, intermediate, and marts models, but it **never writes directly to `raw`**. All writes to `raw` come exclusively from Kafka Connect. This strict separation prevents accidental dbt modifications to source data. |
+| **`airflow_runner`** with `INSERT` on `raw.model_performance_log` | The PySpark retraining job runs as an Airflow task and writes model evaluation metrics directly to this table. This is the **only** write access any role has to the `raw` schema besides `kafka_connect`. It is intentionally narrow. |
+| **`debezium`** with only `SELECT` on `raw` | Logical replication reads the WAL, not the tables directly, to capture changes. However, the `debezium` role still needs `SELECT` permission to perform the initial snapshot of the table. The required `REPLICATION` privilege was granted at role creation time in Section 1. |
+| **`airflow_runner`** with `SELECT` on `marts` | Airflow runs data quality checks against the final marts tables to ensure they meet freshness and accuracy SLAs. |
+| **`kafka_connect`** with `INSERT` on `raw.dlq_events` | This is a separate grant from the bulk `raw` grant because it serves a different purpose. If Kafka Connect fails to write to a target table, it writes the failed message to this dead-letter queue. This permission ensures that even when the primary sink fails, the error can still be recorded. |
+
+#### Notable omissions (intentional)
+
+Every grant is chosen to give each role exactly the permissions it needs—**nothing more**. This "principle of least privilege" limits the potential impact if any credential is ever compromised.
+
+| Missing Grant | Why It's Deliberate |
+| :--- | :--- |
+| **`api_reader`** on `raw` | The API should never read raw, unaggregated data. It only serves data from the `marts` schema. |
+| **`airflow_runner`** on `staging` / `intermediate` | Airflow monitors data quality by comparing `raw` and `marts` tables. It has no need to read the intermediate layers. |
+| **`debezium`** on any table other than `raw.fraud_investigation_outcomes` | Change Data Capture (CDC) is scoped to exactly one table to minimise WAL volume and replication slot overhead (see Section 8). |
+| **`dbt_runner`** on `raw.dlq_events` | The dead-letter queue is for operational monitoring and manual replay; dbt transformations should never read from it. |
+
+#### Principle of least privilege
+
+The permission model is designed to contain security breaches. If a credential is compromised, the damage is limited to the bare minimum required for that service to function:
+
+- **Compromised `api_reader`** → Attacker can only see aggregated `marts` data, not raw member details or claims.
+- **Compromised `airflow_runner`** → Attacker can read `raw` and `marts`, and can write to `model_performance_log`, but cannot modify any other `raw` data or access `staging`/`intermediate`.
+- **Compromised `debezium`** → Attacker can `SELECT` from `raw.fraud_investigation_outcomes` but cannot write to any table.
 
 ---
 
