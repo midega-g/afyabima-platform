@@ -355,9 +355,83 @@ CREATE PUBLICATION afyabima_debezium
     FOR TABLE raw.fraud_investigation_outcomes;
 ```
 
-A PostgreSQL publication declares which tables Debezium monitors for CDC (change data capture). Only `raw.fraud_investigation_outcomes` is included — not the entire `raw` schema — to minimise WAL volume. Every INSERT into this table triggers a WAL record that Debezium reads and publishes to the `investigations.closed` Kafka topic. The ML retraining pipeline consumes that topic to update the training dataset with labelled outcomes.
+**What WAL (Write-Ahead Log) is:** PostgreSQL records every change to the database in a sequential log called the WAL before it writes to the actual data files. This ensures durability — if the server crashes, it can replay the WAL to recover. **Logical replication** reads the WAL and decodes changes into a format (row inserts/updates/deletes) that can be sent to external systems.
 
-`wal_level=logical` must be active for this publication to work. It is set in `docker-compose.yml` at server start, not in this file — PostgreSQL does not allow `wal_level` to be changed via SQL; it requires a server restart with the parameter in `postgresql.conf` or the command line.
+**Why Debezium is the right tool:** Debezium is a CDC (Change Data Capture) platform that connects to PostgreSQL's logical replication stream and publishes each change as an event to Kafka. Compared to alternatives:
+
+- **Polling queries** (`SELECT * FROM table WHERE updated_at > ?`) would miss deletes and add load
+- **Triggers** would require writing to a separate table and add per-transaction overhead
+- **LISTEN/NOTIFY** doesn't capture the changed data itself, only notifies that something happened
+
+Debezium provides exactly-once semantics, schema evolution handling, and integrates natively with Kafka — the core event bus of the platform.
+
+**Why only this table:** The publication declares which tables Debezium monitors. Only `raw.fraud_investigation_outcomes` is included — not the entire `raw` schema — for three reasons:
+
+1. **WAL volume** — Every INSERT/UPDATE/DELETE in `raw` generates WAL traffic. Monitoring all tables would flood the replication slot with irrelevant events (thousands of claim inserts, vital sign updates, etc.) for every one outcome row we actually need.
+2. **Focus** — The fraud feedback loop is the only pipeline that requires real-time CDC. Other tables are consumed by Kafka Connect via JDBC sinks on a schedule.
+3. **Slot management** — Each replication slot reserves WAL segments until they're consumed. A slot monitoring the entire `raw` schema would force PostgreSQL to retain WAL much longer, increasing disk usage.
+
+**What happens when an outcome is inserted:**
+
+```txt
+1. INSERT into raw.fraud_investigation_outcomes
+2. PostgreSQL writes the change to WAL
+3. Debezium (connected as 'debezium' role) reads the logical decoding stream
+4. Debezium transforms the row into a Kafka message (Avro, with schema)
+5. Message published to 'investigations.closed' Kafka topic
+6. ML retraining pipeline (consuming that topic) adds the labelled outcome to training dataset
+```
+
+**Critical prerequisites:**
+
+```sql
+-- 1. WAL level must be logical (set at server start, not in SQL)
+SHOW wal_level;  -- Must return 'logical'
+
+-- 2. debezium role must have REPLICATION privilege (already granted in Section 1)
+SELECT rolname, rolreplication FROM pg_roles WHERE rolname = 'debezium';
+
+-- 3. The publication must exist before Debezium connects
+SELECT * FROM pg_publication WHERE pubname = 'afyabima_debezium';
+
+-- 4. Replication slot must be created by Debezium (automatic on first connection)
+-- View active slots:
+SELECT slot_name, slot_type, active FROM pg_replication_slots;
+```
+
+**`wal_level=logical`** is set in `docker-compose.yml` because it requires a server restart — it cannot be changed dynamically:
+
+```yaml
+# docker-compose.yml
+command: postgres -c wal_level=logical -c max_replication_slots=5 -c max_wal_senders=5
+```
+
+**Replication slot management:** Each Debezium connector creates a replication slot. Slots must be monitored — if a slot becomes inactive (connector down), WAL segments accumulate and can fill disk. The operations runbook includes:
+
+```sql
+-- Monitor slot lag (bytes not yet consumed)
+SELECT slot_name, database, active, pg_wal_lsn_diff(
+    pg_current_wal_lsn(), 
+    restart_lsn
+) as lag_bytes
+FROM pg_replication_slots;
+```
+
+**If Debezium is down:** WAL continues to accumulate until the slot is resumed or dropped. After 24 hours, this can reach gigabytes. Recovery procedure:
+
+1. Fix the connector configuration
+2. Restart Debezium connector — it resumes from where it left off
+3. If slot is corrupted, delete and recreate (requires re-snapshot)
+
+**Security considerations:** The replication stream contains all data from the monitored table — including sensitive investigation notes. The `debezium` role has `SELECT` on the table and `REPLICATION` privilege, but the connection must be over SSL in production to prevent wire-level eavesdropping.
+
+**Why not use a trigger instead?** A trigger could write to an `outgoing_events` table, and Kafka Connect could poll that table. This would work but adds:
+
+- Per-transaction overhead (every INSERT would fire the trigger)
+- Need to track what's been sent (offset management)
+- Risk of duplicate or missed events on failure
+
+Debezium's WAL-based approach has no impact on transaction performance and provides exactly-once semantics with offset tracking in Kafka.
 
 ### Section 9 — Explicit table-level grants
 
