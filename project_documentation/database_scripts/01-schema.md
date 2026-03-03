@@ -164,17 +164,62 @@ Three indexes target the most frequent access patterns:
 
 Six tables that grow continuously as claims move through the system. These are the primary targets for Kafka Connect writes.
 
-**`raw.claims`** — the central fact of the system. Every other transactional table references it. The claim `status` column is constrained to nine lifecycle values. The two most important constraints: `claims_service_before_submit_chk` (service date cannot be after submission date — a common fraud signal when violated) and `claims_approved_lte_claimed_chk` (approved amount cannot exceed claimed amount). The composite index `idx_claims_dup_detection` on `(member_id, provider_id, diagnosis_code, date_of_service)` is built specifically for the duplicate claim fraud detection query.
+**`raw.claims`** — the central fact of the system. Every other transactional table references it. The claim `status` column is constrained to nine lifecycle values. The two most important constraints: `claims_service_before_submit_chk` (service date cannot be after submission date — a common fraud signal when violated) and `claims_approved_lte_claimed_chk` (approved amount cannot exceed claimed amount).
 
-**`raw.claim_events`** — an immutable append-only log of every state transition a claim passes through. It is never updated after insert. `triggered_by` constrains who or what can generate an event to five known actors. The `BRIN` index on `event_at` is efficient here because new events always have timestamps later than existing ones — BRIN is designed for exactly this monotonically increasing pattern.
+Seven indexes support the access patterns required by dbt, fraud detection, and API queries:
 
-**`raw.vitals`** — clinical measurements at point of service. All numeric columns have physiologically bounded `CHECK` constraints: blood pressure, heart rate, temperature, weight, height, BMI, and SpO2 are all guarded against impossible values. The absence of a vitals row for a consultation claim is itself a fraud signal — the phantom-billing pattern.
+| Index | Purpose |
+| ------- | --------- |
+| `idx_claims_member_id`, `provider_id`, `diagnosis_code` | Standard FK lookups — every mart join uses at least one of these |
+| `idx_claims_date_of_service` | Range scans for time-windowed fraud features (e.g., "claims in last 7 days"). B-tree chosen because `date_of_service` can be backdated (not append-only) |
+| `idx_claims_status` | Airflow quality checks and dashboards filtering on `status = 'flagged_fraud'` |
+| `idx_claims_submitted_at` | dbt source freshness monitoring — identifies ingestion delays |
+| `idx_claims_dup_detection` | **Composite index** specifically for duplicate claim detection. Covering all four columns in one index lets the query below run in milliseconds rather than scanning the entire table. |
 
-**`raw.prescriptions`** — one row per drug prescribed per claim. References `raw.drug_formulary` directly, meaning prescriptions for drugs not in the formulary are rejected at the database level, not by application code. `dispensed_on_site` distinguishes whether the pharmacy dispensed at the facility (TRUE) or the member collected externally.
+  ```sql
+  SELECT claim_id FROM raw.claims 
+  WHERE member_id = :x AND provider_id = :y 
+    AND diagnosis_code = :z 
+    AND date_of_service BETWEEN now() - interval '48 hours' AND now()
+  ```
 
-**`raw.payments`** — one row per payment disbursement. A single claim can have multiple payment rows (partial payments or phased disbursements). `payment_method` constrains to four known channels. The `BRIN` index on `paid_at` follows the same reasoning as `claim_events` — payments accumulate chronologically.
+**`raw.claim_events`** — an immutable append-only log of every state transition a claim passes through. It is never updated after insert. `triggered_by` constrains who or what can generate an event to five known actors. Two indexes serve the required query patterns:
 
-**`raw.stock_levels`** — daily pharmacy stock snapshots. The natural key would be `(facility_id, drug_code, reported_date)` but a surrogate UUID is used as the primary key because the combination would make the primary key large and expensive to reference. The natural key is enforced separately as a `UNIQUE` constraint. The `BRIN` index on `reported_date` serves the supply chain mart aggregations.
+| Index | Purpose |
+| ------- | --------- |
+| `idx_claim_events_claim_id` | FK lookup — every investigation that needs claim history uses this |
+| `idx_claim_events_event_at` | **BRIN index** — events arrive in chronological order. The BRIN index is 1/10th the size of a B-tree and serves all time-range queries (e.g., "events in last hour") with equivalent performance |
+
+**`raw.vitals`** — clinical measurements at point of service. All numeric columns have physiologically bounded `CHECK` constraints: blood pressure, heart rate, temperature, weight, height, BMI, and SpO2 are all guarded against impossible values. The absence of a vitals row for a consultation claim is itself a fraud signal — the phantom-billing pattern. Two indexes cover the essential access paths:
+
+| Index | Purpose |
+| ------- | --------- |
+| `idx_vitals_claim_id` | Primary lookup path — joining vitals back to claims for fraud detection |
+| `idx_vitals_member_id` | Used when building member clinical history for risk adjustment models |
+
+**`raw.prescriptions`** — one row per drug prescribed per claim. References `raw.drug_formulary` directly, meaning prescriptions for drugs not in the formulary are rejected at the database level, not by application code. `dispensed_on_site` distinguishes whether the pharmacy dispensed at the facility (TRUE) or the member collected externally. Indexes support the three main access patterns:
+
+| Index | Purpose |
+| ------- | --------- |
+| `idx_prescriptions_claim_id` | Joining prescriptions back to claims for completeness checks |
+| `idx_prescriptions_member_id` | Member medication history queries |
+| `idx_prescriptions_drug_code` | Drug utilization analysis and formulary compliance monitoring |
+
+**`raw.payments`** — one row per payment disbursement. A single claim can have multiple payment rows (partial payments or phased disbursements). `payment_method` constrains to four known channels. Two indexes serve the required queries:
+
+| Index | Purpose |
+| ------- | --------- |
+| `idx_payments_claim_id` | FK lookup — all payment inquiries start from a claim |
+| `idx_payments_paid_at` | **BRIN index** — payments accumulate chronologically. Used by financial reporting and reconciliation queries |
+
+**`raw.stock_levels`** — daily pharmacy stock snapshots. The natural key would be `(facility_id, drug_code, reported_date)` but a surrogate UUID is used as the primary key because the combination would make the primary key large and expensive to reference. The natural key is enforced separately as a `UNIQUE` constraint. Three indexes support supply chain analytics:
+
+| Index | Purpose |
+| ------- | --------- |
+| `idx_stock_levels_facility_id` | All queries for a specific facility's inventory use this |
+| `idx_stock_levels_drug_code` | Drug-level stockout analysis across facilities |
+| `idx_stock_levels_reported_date` | **BRIN index** — chronological snapshots. Enables time-series analysis without scanning full table |
+| `stock_levels_facility_drug_date_uq` | **Unique constraint** — enforces business rule: one snapshot per facility/drug/date |
 
 ### Section 5 — raw fraud pipeline tables
 
